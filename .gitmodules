@@ -1,0 +1,6 @@
+[submodule "iced"]
+	path = iced
+	url = https://github.com/iced-rs/iced
+[submodule "fpsdk"]
+	path = fpsdk
+	url = https://github.com/tonikasoft/fpsdk
