@@ -1,7 +1,9 @@
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use std::io::{self, Read};
 use std::panic::RefUnwindSafe;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Once};
+use tokio::sync::mpsc;
 
 use bincode;
 use log::{error, info, trace, LevelFilter};
@@ -20,17 +22,23 @@ const LOG_PATH: &str = "S:/emilydotgg-random.log";
 
 mod ui;
 
+pub(crate) const CONTROLLER_COUNT: u32 = 10;
+
 #[derive(Debug)]
 struct Simple {
     host: Host,
     tag: plugin::Tag,
-    state: State,
-    ui_send: Option<Mutex<tokio::sync::mpsc::Sender<ui::UIMessage>>>,
-    host_receive: Option<Mutex<tokio::sync::mpsc::Receiver<ui::HostMessage>>>,
+    state: Arc<Mutex<State>>,
+    ui_send: mpsc::Sender<ui::UIMessage>,
+    ui_receive: Option<mpsc::Receiver<ui::UIMessage>>,
+    host_send: mpsc::Sender<ui::HostMessage>,
+    host_receive: mpsc::Receiver<ui::HostMessage>,
     proxy: Option<PluginProxy>,
+    controller_values: Arc<Mutex<Option<Vec<u64>>>>,
+    tick_happened: Arc<(Mutex<bool>, Condvar)>,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 struct State {
     seed: u64,
     speed: u64,
@@ -44,13 +52,89 @@ impl Plugin for Simple {
 
         info!("init plugin with tag {}", tag);
 
+        let controller_values = Arc::new(Mutex::new(Option::default()));
+        let state = Arc::new(Mutex::new(State {
+            speed: 400,
+            tick: 1,
+            ..Default::default()
+        }));
+
+        let weak_state = Arc::downgrade(&state);
+
+        let gen_controller_values = controller_values.clone();
+
+        let (ui_send, ui_receive) = mpsc::channel(100);
+        let (host_send, host_receive) = mpsc::channel(100);
+
+        let tick_happened = Arc::new((Mutex::new(false), Condvar::new()));
+        let gen_tick_happened = tick_happened.clone();
+
+        let gen_ui_send = ui_send.clone();
+
+        let gen_thread_handle = std::thread::spawn(move || {
+            let controller_values = gen_controller_values;
+
+            while let Some(state) = weak_state.upgrade() {
+                // Wait for a tick to happen before doing anything
+                {
+                    let &(ref tick_lock, ref cvar) = &*gen_tick_happened;
+                    let mut tick = tick_lock.lock();
+                    while !*tick {
+                        cvar.wait(&mut tick);
+                    }
+                    *tick = false;
+                }
+
+                // Steal state
+                let mut state = {
+                    let state = state.lock();
+                    state.clone()
+                };
+
+                if state.speed == 0 {
+                    state.speed = 1;
+                }
+
+                if state.tick % state.speed == 0 {
+                    let mut values = vec![0_u64; CONTROLLER_COUNT as usize];
+
+                    if state.speed == 0 {
+                        state.speed = 1;
+                    }
+
+                    // Generate some new values NOW
+                    let mut rng = thread_rng();
+
+                    for v in &mut values {
+                        let random_value = rng.gen_range(0..0x1000);
+                        *v = random_value << 32;
+                    }
+
+                    // Store values
+                    (*controller_values.lock()).replace(values.clone());
+
+                    let ui_message =
+                        UIMessage::UpdateControllers(values.into_iter().enumerate().collect());
+
+                    // Inform UI of what we are doing
+                    gen_ui_send.blocking_send(ui_message).unwrap();
+                }
+            }
+
+            info!("Gen thread done");
+        });
+
         Self {
             host,
             tag,
-            state: Default::default(),
-            ui_send: None,
-            host_receive: None,
+            state,
+            ui_send,
+            ui_receive: Some(ui_receive),
+            host_send,
+            host_receive,
             proxy: None,
+            controller_values,
+            tick_happened,
         }
     }
 
@@ -69,7 +153,8 @@ impl Plugin for Simple {
     }
 
     fn save_state(&mut self, writer: StateWriter) {
-        match bincode::serialize_into(writer, &self.state) {
+        let state = self.state.lock();
+        match bincode::serialize_into(writer, &*state) {
             Ok(_) => info!("state {:?} saved", self.state),
             Err(e) => error!("error serializing state {}", e),
         }
@@ -88,32 +173,27 @@ impl Plugin for Simple {
                 })
             })
             .and_then(|value| {
-                self.state = value;
+                self.state = Arc::new(Mutex::new(value));
                 Ok(info!("read state {:?}", self.state))
             })
             .unwrap_or_else(|e| error!("error reading value from state {}", e));
     }
 
     fn on_message(&mut self, message: host::Message) -> Box<dyn AsRawPtr> {
+        info!("Plugin got {:?}", message);
         match message {
             host::Message::SetEnabled(enabled) => {
                 self.on_set_enabled(enabled, message);
             }
             host::Message::ShowEditor(handle) => self
                 .ui_send
-                .as_ref()
-                .unwrap()
-                .lock()
                 .blocking_send(ui::UIMessage::ShowEditor(handle))
                 .unwrap(),
             _ => (),
         }
 
         // See if we have any responses from the ui
-        while let Ok(response) = self.host_receive.as_ref().map_or(
-            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected),
-            |r| r.lock().try_recv(),
-        ) {
+        while let Ok(response) = self.host_receive.try_recv() {
             info!("Host got {response:?}");
             match response {
                 ui::HostMessage::SetEditorHandle(hwnd) => {
@@ -139,21 +219,23 @@ impl Plugin for Simple {
     }
 
     fn tick(&mut self) {
-        self.state.tick += 1;
-
-        if self.state.speed == 0 {
-            self.state.speed = 1
+        // inform gen about the tick
+        {
+            let &(ref lock, ref cvar) = &*self.tick_happened;
+            let mut tick = lock.lock();
+            *tick = true;
+            cvar.notify_one();
         }
 
-        if self.state.tick % self.state.speed == 0 {
-            let mut rng = thread_rng();
+        let mut state = self.state.lock();
+        state.tick += 1;
 
-            for i in 0..100 {
-                let random_value = rng.gen_range(0..0x1000);
-                let random_value = random_value << 32;
-                self.host.on_controller(self.tag, i, random_value);
-            }
-        }
+        // Inform FL about all our values
+        self.controller_values.lock().take().map(|v| {
+            v.into_iter()
+                .enumerate()
+                .map(|(i, v)| self.host.on_controller(self.tag, i, v))
+        });
     }
 
     fn idle(&mut self) {
@@ -188,7 +270,7 @@ impl Plugin for Simple {
             let speed = value.get::<u16>() as f64;
             let speed = (speed * 200.0) / 65535.0;
 
-            self.state.speed = speed as u64;
+            self.state.lock().speed = speed as u64;
         }
 
         Box::new(0)
@@ -209,9 +291,7 @@ impl Simple {
         if enabled {
             // Enable GUI
             info!("Starting UI");
-            let (ui_tx, host_rx) = ui::run();
-            self.ui_send = Some(Mutex::new(ui_tx));
-            self.host_receive = Some(Mutex::new(host_rx))
+            ui::run(self.ui_receive.take().unwrap(), self.host_send.clone());
         }
     }
 
@@ -252,3 +332,5 @@ fn _init_log() {
 create_plugin!(Simple);
 
 use std::panic;
+
+use crate::ui::UIMessage;

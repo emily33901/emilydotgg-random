@@ -5,11 +5,18 @@ use fpsdk::host::Host;
 use futures::lock::Mutex;
 use futures::stream;
 use iced::pure::widget::Text;
-use iced::pure::Element;
 use iced::pure::{button, column, text, Application};
+use iced::pure::{scrollable, Element};
 use iced::{Alignment, Command, Settings};
 use log::info;
 use tokio::sync::{mpsc, watch};
+
+use crate::ui::chart::UpdateState;
+use crate::CONTROLLER_COUNT;
+
+use self::chart::WaveformChart;
+
+mod chart;
 
 #[derive(Debug)]
 pub struct App {
@@ -17,9 +24,10 @@ pub struct App {
     ui_message_rx: Arc<Mutex<mpsc::Receiver<UIMessage>>>,
     host_message_tx: Arc<Mutex<mpsc::Sender<HostMessage>>>,
     hwnd: parking_lot::Mutex<Option<*mut c_void>>,
+    charts: Vec<chart::WaveformChart>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum Message {
     None,
     IncrementPressed,
@@ -27,15 +35,18 @@ pub enum Message {
     HostMessage(UIMessage),
 }
 
-#[derive(Debug, Clone, Copy)]
+/// Message from the Plugin to the UI
+#[derive(Debug, Clone)]
 pub enum UIMessage {
     ShowEditor(Option<*mut c_void>),
+    UpdateControllers(Vec<(usize, u64)>),
 }
 
 unsafe impl Send for UIMessage {}
 unsafe impl Sync for UIMessage {}
 
 #[derive(Debug, Clone, Copy)]
+/// Message from the UI to the Plugin
 pub enum HostMessage {
     SetEditorHandle(Option<*mut c_void>),
 }
@@ -58,6 +69,9 @@ impl Application for App {
                 ui_message_rx: Arc::new(Mutex::new(flags.ui_message_rx)),
                 host_message_tx: Arc::new(Mutex::new(flags.host_message_tx)),
                 hwnd: parking_lot::Mutex::new(None),
+                charts: (0..CONTROLLER_COUNT)
+                    .map(|_| WaveformChart::new())
+                    .collect(),
             },
             Command::none(),
         )
@@ -72,6 +86,7 @@ impl Application for App {
             Message::None => None,
             Message::IncrementPressed => {
                 self.value += 1;
+                // Update chart
                 None
             }
             Message::DecrementPressed => {
@@ -101,6 +116,14 @@ impl Application for App {
                     |_| Message::None,
                 ))
             }
+            Message::HostMessage(UIMessage::UpdateControllers(updates)) => {
+                for (controller_i, new_v) in updates {
+                    self.charts[controller_i].update(UpdateState {
+                        new_value: (new_v >> 32) as i32,
+                    });
+                }
+                None
+            }
             Message::HostMessage(message) => {
                 info!("UI got message {message:?}");
                 None
@@ -119,13 +142,18 @@ impl Application for App {
     }
 
     fn view(&self) -> Element<Message> {
-        column()
+        let mut column = column()
             .padding(20)
             .align_items(Alignment::Center)
             .push(button(Text::new("Increment")).on_press(Message::IncrementPressed))
             .push(Text::new(self.value.to_string()).size(50))
-            .push(button(Text::new("Decrement")).on_press(Message::DecrementPressed))
-            .into()
+            .push(button(Text::new("Decrement")).on_press(Message::DecrementPressed));
+
+        for chart in &self.charts {
+            column = column.push(chart.view());
+        }
+
+        scrollable(column).into()
     }
 
     type Executor = iced::executor::Default;
@@ -169,22 +197,18 @@ where
     }
 }
 
-pub(crate) fn run() -> (
-    tokio::sync::mpsc::Sender<UIMessage>,
-    mpsc::Receiver<HostMessage>,
+pub(crate) fn run(
+    ui_message_rx: tokio::sync::mpsc::Receiver<UIMessage>,
+    host_message_tx: mpsc::Sender<HostMessage>,
 ) {
-    let (ui_message_tx, ui_message_rx) = tokio::sync::mpsc::channel::<UIMessage>(10);
-    let (host_message_tx, host_message_rx) = tokio::sync::mpsc::channel::<HostMessage>(10);
-
     std::thread::spawn(|| {
         info!("Starting UI");
-        App::run(iced::Settings::with_flags(AppFlags {
+        let mut settings = iced::Settings::with_flags(AppFlags {
             ui_message_rx,
             host_message_tx,
-        }))
-        .unwrap();
+        });
+        settings.antialiasing = true;
+        App::run(settings).unwrap();
         info!("ui thread finished");
     });
-
-    (ui_message_tx, host_message_rx)
 }
