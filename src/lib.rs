@@ -3,10 +3,11 @@ use std::io::{self, Read};
 use std::panic::RefUnwindSafe;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Once};
+use std::thread::JoinHandle;
 use tokio::sync::mpsc;
 
 use bincode;
-use log::{error, info, trace, LevelFilter};
+use log::{error, info, trace, warn, LevelFilter};
 use rand::{thread_rng, Rng};
 use serde::{Deserialize, Serialize};
 #[cfg(windows)]
@@ -22,7 +23,7 @@ const LOG_PATH: &str = "S:/emilydotgg-random.log";
 
 mod ui;
 
-pub(crate) const CONTROLLER_COUNT: u32 = 10;
+pub(crate) const CONTROLLER_COUNT: u32 = 100;
 
 #[derive(Debug)]
 struct Simple {
@@ -36,6 +37,7 @@ struct Simple {
     proxy: Option<PluginProxy>,
     controller_values: Arc<Mutex<Option<Vec<u64>>>>,
     tick_happened: Arc<(Mutex<bool>, Condvar)>,
+    ui_thread: Option<JoinHandle<()>>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
@@ -135,6 +137,7 @@ impl Plugin for Simple {
             proxy: None,
             controller_values,
             tick_happened,
+            ui_thread: None,
         }
     }
 
@@ -291,7 +294,10 @@ impl Simple {
         if enabled {
             // Enable GUI
             info!("Starting UI");
-            ui::run(self.ui_receive.take().unwrap(), self.host_send.clone());
+            self.ui_thread = Some(ui::run(
+                self.ui_receive.take().unwrap(),
+                self.host_send.clone(),
+            ));
         }
     }
 
@@ -310,6 +316,22 @@ impl Simple {
 
     fn say_hello_hint(&mut self) {
         self.host.on_hint(self.tag, "^c Hello".to_string());
+    }
+}
+
+impl Drop for Simple {
+    fn drop(&mut self) {
+        info!("Dropping Plugin");
+        // Tell the UI that we are dying
+        self.ui_send.blocking_send(UIMessage::Die).unwrap();
+        // Wait for UI to die
+        if let Some(ui_thread) = self.ui_thread.take() {
+            info!("Waiting for UI to die");
+            ui_thread.join().unwrap();
+            info!("UI died");
+        } else {
+            warn!("No UI?");
+        }
     }
 }
 

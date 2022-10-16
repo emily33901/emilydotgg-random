@@ -54,9 +54,8 @@ impl Chart<Message> for WaveformChart {
             .unwrap();
 
         chart
-            .draw_series(AreaSeries::new(
+            .draw_series(LineSeries::new(
                 self.values.iter().map(|x| (x.0, x.1 as i32)),
-                0,
                 &RED,
             ))
             .unwrap();
@@ -85,7 +84,7 @@ impl WaveformChart {
 
     pub(crate) fn view(&self) -> Element<Message> {
         let chart = ChartWidget::new(self)
-            .height(Length::Units(300))
+            .height(Length::Units(200))
             .width(Length::Fill);
 
         chart.into()

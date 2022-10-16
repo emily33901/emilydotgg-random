@@ -25,6 +25,7 @@ pub struct App {
     host_message_tx: Arc<Mutex<mpsc::Sender<HostMessage>>>,
     hwnd: parking_lot::Mutex<Option<*mut c_void>>,
     charts: Vec<chart::WaveformChart>,
+    should_exit: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +41,7 @@ pub enum Message {
 pub enum UIMessage {
     ShowEditor(Option<*mut c_void>),
     UpdateControllers(Vec<(usize, u64)>),
+    Die,
 }
 
 unsafe impl Send for UIMessage {}
@@ -72,6 +74,7 @@ impl Application for App {
                 charts: (0..CONTROLLER_COUNT)
                     .map(|_| WaveformChart::new())
                     .collect(),
+                should_exit: false,
             },
             Command::none(),
         )
@@ -99,10 +102,13 @@ impl Application for App {
                     use windows::Win32::UI::WindowsAndMessaging;
                     let self_hwnd = self.hwnd.lock();
                     let self_hwnd = HWND(self_hwnd.map_or(0, |x| x as isize) as isize);
-                    let parent_hwnd = HWND(hwnd.map_or(0, |x| x as isize));
-
-                    WindowsAndMessaging::SetParent(self_hwnd, parent_hwnd);
-                    WindowsAndMessaging::ShowWindow(self_hwnd, WindowsAndMessaging::SW_SHOW);
+                    if let Some(parent_hwnd) = hwnd.map(|x| HWND(x as isize)) {
+                        WindowsAndMessaging::SetParent(self_hwnd, parent_hwnd);
+                        WindowsAndMessaging::ShowWindow(self_hwnd, WindowsAndMessaging::SW_SHOW);
+                    } else {
+                        WindowsAndMessaging::SetParent(self_hwnd, HWND(0));
+                        WindowsAndMessaging::ShowWindow(self_hwnd, WindowsAndMessaging::SW_HIDE);
+                    }
                 }
 
                 info!("Set parent!");
@@ -122,6 +128,11 @@ impl Application for App {
                         new_value: (new_v >> 32) as i32,
                     });
                 }
+                None
+            }
+            Message::HostMessage(UIMessage::Die) => {
+                info!("UI going down!");
+                self.should_exit = true;
                 None
             }
             Message::HostMessage(message) => {
@@ -154,6 +165,10 @@ impl Application for App {
         }
 
         scrollable(column).into()
+    }
+
+    fn should_exit(&self) -> bool {
+        self.should_exit
     }
 
     type Executor = iced::executor::Default;
@@ -200,7 +215,7 @@ where
 pub(crate) fn run(
     ui_message_rx: tokio::sync::mpsc::Receiver<UIMessage>,
     host_message_tx: mpsc::Sender<HostMessage>,
-) {
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(|| {
         info!("Starting UI");
         let mut settings = iced::Settings::with_flags(AppFlags {
@@ -210,5 +225,5 @@ pub(crate) fn run(
         settings.antialiasing = true;
         App::run(settings).unwrap();
         info!("ui thread finished");
-    });
+    })
 }
