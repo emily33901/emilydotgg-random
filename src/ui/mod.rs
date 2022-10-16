@@ -20,7 +20,6 @@ mod chart;
 
 #[derive(Debug)]
 pub struct App {
-    value: i32,
     ui_message_rx: Arc<Mutex<mpsc::Receiver<UIMessage>>>,
     host_message_tx: Arc<Mutex<mpsc::Sender<HostMessage>>>,
     hwnd: parking_lot::Mutex<Option<*mut c_void>>,
@@ -31,8 +30,6 @@ pub struct App {
 #[derive(Debug, Clone)]
 pub enum Message {
     None,
-    IncrementPressed,
-    DecrementPressed,
     HostMessage(UIMessage),
 }
 
@@ -67,7 +64,6 @@ impl Application for App {
     fn new(flags: Self::Flags) -> (Self, Command<Self::Message>) {
         (
             Self {
-                value: 0,
                 ui_message_rx: Arc::new(Mutex::new(flags.ui_message_rx)),
                 host_message_tx: Arc::new(Mutex::new(flags.host_message_tx)),
                 hwnd: parking_lot::Mutex::new(None),
@@ -87,15 +83,6 @@ impl Application for App {
     fn update(&mut self, message: Message) -> iced::Command<Self::Message> {
         let command = match message {
             Message::None => None,
-            Message::IncrementPressed => {
-                self.value += 1;
-                // Update chart
-                None
-            }
-            Message::DecrementPressed => {
-                self.value -= 1;
-                None
-            }
             Message::HostMessage(UIMessage::ShowEditor(hwnd)) => {
                 unsafe {
                     use windows::Win32::Foundation::*;
@@ -153,12 +140,7 @@ impl Application for App {
     }
 
     fn view(&self) -> Element<Message> {
-        let mut column = column()
-            .padding(20)
-            .align_items(Alignment::Center)
-            .push(button(Text::new("Increment")).on_press(Message::IncrementPressed))
-            .push(Text::new(self.value.to_string()).size(50))
-            .push(button(Text::new("Decrement")).on_press(Message::DecrementPressed));
+        let mut column = column().padding(20).align_items(Alignment::Center);
 
         for chart in &self.charts {
             column = column.push(chart.view());
