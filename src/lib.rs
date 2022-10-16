@@ -23,6 +23,10 @@ const LOG_PATH: &str = "S:/emilydotgg-random.log";
 
 mod ui;
 
+#[cfg(debug_assertions)]
+pub(crate) const CONTROLLER_COUNT: u32 = 10;
+
+#[cfg(not(debug_assertions))]
 pub(crate) const CONTROLLER_COUNT: u32 = 100;
 
 #[derive(Debug)]
@@ -74,6 +78,7 @@ impl Plugin for Simple {
         let gen_ui_send = ui_send.clone();
 
         let gen_thread_handle = std::thread::spawn(move || {
+            info!("Starting Gen thread!");
             let controller_values = gen_controller_values;
 
             while let Some(state) = weak_state.upgrade() {
@@ -99,10 +104,6 @@ impl Plugin for Simple {
 
                 if state.tick % state.speed == 0 {
                     let mut values = vec![0_u64; CONTROLLER_COUNT as usize];
-
-                    if state.speed == 0 {
-                        state.speed = 1;
-                    }
 
                     // Generate some new values NOW
                     let mut rng = thread_rng();
@@ -176,7 +177,7 @@ impl Plugin for Simple {
                 })
             })
             .and_then(|value| {
-                self.state = Arc::new(Mutex::new(value));
+                *self.state.lock() = value;
                 Ok(info!("read state {:?}", self.state))
             })
             .unwrap_or_else(|e| error!("error reading value from state {}", e));
@@ -229,15 +230,16 @@ impl Plugin for Simple {
             *tick = true;
             cvar.notify_one();
         }
-
-        let mut state = self.state.lock();
-        state.tick += 1;
+        {
+            let mut state = self.state.lock();
+            state.tick += 1;
+        }
 
         // Inform FL about all our values
         self.controller_values.lock().take().map(|v| {
-            v.into_iter()
-                .enumerate()
-                .map(|(i, v)| self.host.on_controller(self.tag, i, v))
+            for (i, v) in v.into_iter().enumerate() {
+                self.host.on_controller(self.tag, i, v)
+            }
         });
     }
 
@@ -332,6 +334,8 @@ impl Drop for Simple {
         } else {
             warn!("No UI?");
         }
+
+        info!("Goodbye!");
     }
 }
 
