@@ -184,7 +184,7 @@ impl Plugin for Simple {
     }
 
     fn on_message(&mut self, message: host::Message) -> Box<dyn AsRawPtr> {
-        info!("Plugin got {:?}", message);
+        // info!("Plugin got {:?}", message);
         match message {
             host::Message::SetEnabled(enabled) => {
                 self.on_set_enabled(enabled, message);

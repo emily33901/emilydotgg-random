@@ -25,6 +25,7 @@ pub struct App {
     hwnd: parking_lot::Mutex<Option<*mut c_void>>,
     charts: Vec<chart::WaveformChart>,
     should_exit: bool,
+    should_draw: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +72,7 @@ impl Application for App {
                     .map(|_| WaveformChart::new())
                     .collect(),
                 should_exit: false,
+                should_draw: false,
             },
             Command::none(),
         )
@@ -84,6 +86,8 @@ impl Application for App {
         let command = match message {
             Message::None => None,
             Message::HostMessage(UIMessage::ShowEditor(hwnd)) => {
+                self.should_draw = hwnd.is_some();
+
                 unsafe {
                     use windows::Win32::Foundation::*;
                     use windows::Win32::UI::WindowsAndMessaging;
@@ -140,6 +144,12 @@ impl Application for App {
     }
 
     fn view(&self) -> Element<Message> {
+        // TODO(emily): Probably shouldn't just spin here, but in that case we would need a better way to resume
+        // that isnt a UIMessage. A Convar would probably work well?
+        if !self.should_draw {
+            return column().into();
+        }
+
         let mut column = column().padding(20).align_items(Alignment::Center);
 
         for chart in &self.charts {
