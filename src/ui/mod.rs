@@ -87,7 +87,6 @@ impl Application for App {
             Message::None => None,
             Message::HostMessage(UIMessage::ShowEditor(hwnd)) => {
                 self.should_draw = hwnd.is_some();
-
                 unsafe {
                     use windows::Win32::Foundation::*;
                     use windows::Win32::UI::WindowsAndMessaging;
@@ -97,8 +96,8 @@ impl Application for App {
                         WindowsAndMessaging::SetParent(self_hwnd, parent_hwnd);
                         WindowsAndMessaging::ShowWindow(self_hwnd, WindowsAndMessaging::SW_SHOW);
                     } else {
-                        WindowsAndMessaging::SetParent(self_hwnd, HWND(0));
                         WindowsAndMessaging::ShowWindow(self_hwnd, WindowsAndMessaging::SW_HIDE);
+                        WindowsAndMessaging::SetParent(self_hwnd, HWND(0));
                     }
                 }
 
@@ -215,6 +214,8 @@ pub(crate) fn run(
             host_message_tx,
         });
         settings.antialiasing = true;
+        settings.window.resizable = false;
+        settings.window.decorations = false;
         App::run(settings).unwrap();
         info!("ui thread finished");
     })
