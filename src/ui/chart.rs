@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
-use std::time::Instant;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
+use iced::pure::{row, text};
 use iced::Size;
 use iced::{pure::Element, Length};
 use log::info;
@@ -15,7 +15,7 @@ use super::Message;
 #[derive(Debug)]
 pub(crate) struct WaveformChart {
     pub(crate) cache: Cache,
-    pub(crate) values: VecDeque<(DateTime<Utc>, i32)>,
+    pub(crate) values: VecDeque<(DateTime<Utc>, f32)>,
 }
 
 impl Chart<Message> for WaveformChart {
@@ -32,12 +32,13 @@ impl Chart<Message> for WaveformChart {
         // Acquire time range
         let newest_time = self.values.back().map_or(Utc::now(), |x| x.0);
         let oldest_time = self.values.front().map_or(Utc::now(), |x| x.0);
+        // let oldest_time = Utc::now() - Duration::seconds(5);
 
         let mut chart = builder
             .margin(30)
             .x_label_area_size(30)
             .y_label_area_size(30)
-            .build_cartesian_2d(oldest_time..newest_time, 0..0x1000)
+            .build_cartesian_2d(oldest_time..newest_time, 0.0_f32..1.0)
             .unwrap();
 
         chart
@@ -55,7 +56,7 @@ impl Chart<Message> for WaveformChart {
 
         chart
             .draw_series(LineSeries::new(
-                self.values.iter().map(|x| (x.0, x.1 as i32)),
+                self.values.iter().map(|x| (x.0, x.1)),
                 &RED,
             ))
             .unwrap();
@@ -63,7 +64,11 @@ impl Chart<Message> for WaveformChart {
 }
 
 pub(crate) struct UpdateState {
-    pub new_value: i32,
+    /// Tim eof new value to add
+    pub time: DateTime<Utc>,
+    pub new_value: f32,
+    /// Values that are older than old_time will get removed
+    pub old_time: DateTime<Utc>,
 }
 
 impl WaveformChart {
@@ -75,18 +80,24 @@ impl WaveformChart {
     }
 
     pub(crate) fn update(&mut self, state: UpdateState) {
-        self.values.push_back((Utc::now(), state.new_value));
-        if self.values.len() > 50 {
-            self.values.pop_front();
-        }
+        self.values.push_back((state.time, state.new_value));
+        self.values.retain(|x| x.0 > state.old_time);
         self.cache.clear();
     }
 
     pub(crate) fn view(&self) -> Element<Message> {
-        let chart = ChartWidget::new(self)
-            .height(Length::Units(200))
-            .width(Length::Fill);
+        let mut row = row();
 
-        chart.into()
+        row = row.push(
+            ChartWidget::new(self)
+                .height(Length::Units(200))
+                .width(Length::Fill),
+        );
+        row = row.push(text(format!(
+            "{:0.2}",
+            self.values.back().map_or(0.0, |x| x.1)
+        )));
+
+        row.into()
     }
 }

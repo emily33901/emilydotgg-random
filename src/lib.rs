@@ -1,7 +1,9 @@
+use chrono::Utc;
+use derive_more::{Deref, DerefMut};
 use parking_lot::{Condvar, Mutex};
 use std::io::{self, Read};
 use std::panic::RefUnwindSafe;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Once};
 use std::thread::JoinHandle;
 use tokio::sync::mpsc;
@@ -14,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use simple_logging;
 
 use fpsdk::host::{self, Event, GetName, Host};
-use fpsdk::plugin::{self, Info, InfoBuilder, Plugin, StateReader, StateWriter};
+use fpsdk::plugin::{self, Info, InfoBuilder, StateReader, StateWriter};
 use fpsdk::plugin::{message, PluginProxy};
 use fpsdk::{create_plugin, AsRawPtr, MidiMessage, ProcessParamFlags, TimeFormat, ValuePtr};
 
@@ -29,62 +31,104 @@ pub(crate) const CONTROLLER_COUNT: u32 = 10;
 #[cfg(not(debug_assertions))]
 pub(crate) const CONTROLLER_COUNT: u32 = 100;
 
-#[derive(Debug)]
-struct Simple {
+#[derive(Debug, Deref, DerefMut)]
+struct Plugin {
     host: Host,
     tag: plugin::Tag,
-    state: Arc<Mutex<State>>,
+
+    #[deref]
+    #[deref_mut]
+    inner: Arc<PluginShared>,
     ui_send: mpsc::Sender<ui::UIMessage>,
     ui_receive: Option<mpsc::Receiver<ui::UIMessage>>,
     host_send: mpsc::Sender<ui::HostMessage>,
     host_receive: mpsc::Receiver<ui::HostMessage>,
     proxy: Option<PluginProxy>,
-    controller_values: Arc<Mutex<Option<Vec<u64>>>>,
-    tick_happened: Arc<(Mutex<bool>, Condvar)>,
     ui_thread: Option<JoinHandle<()>>,
 }
 
+pub(crate) fn interpolate<T>() {}
+
+/// Plugin shared state
+#[derive(Debug)]
+struct PluginShared {
+    inputs: Mutex<PluginInputs>,
+    controller_values: Mutex<Option<Vec<(usize, f32)>>>,
+    generators: Mutex<Vec<Generator>>,
+    tick_happened: (Mutex<bool>, Condvar),
+    tick: AtomicU64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+enum Generator {
+    /// Random value
+    Random,
+    /// Random value, interpolating towards
+    RandomInter {
+        // Where to get to
+        target_value: f32,
+        target_tick: u64,
+
+        // Where we are coming from
+        initial_value: f32,
+        initial_tick: u64,
+    },
+}
+
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
-struct State {
+struct PluginInputs {
     seed: u64,
     speed: u64,
-    tick: u64,
     test_val: u64,
 }
 
-impl Plugin for Simple {
+#[derive(Debug, Clone, Deserialize, Serialize)]
+enum SaveState {
+    Ver1 {
+        inputs: PluginInputs,
+        generators: Vec<Generator>,
+    },
+}
+
+impl fpsdk::plugin::Plugin for Plugin {
     fn new(host: Host, tag: plugin::Tag) -> Self {
         init_log();
 
         info!("init plugin with tag {}", tag);
 
-        let controller_values = Arc::new(Mutex::new(Option::default()));
-        let state = Arc::new(Mutex::new(State {
-            speed: 400,
-            tick: 1,
-            ..Default::default()
-        }));
+        let plugin_shared = Arc::new(PluginShared {
+            inputs: Mutex::new(PluginInputs {
+                speed: 400,
+                ..Default::default()
+            }),
+            controller_values: Mutex::new(Option::default()),
+            generators: Mutex::new(vec![
+                Generator::RandomInter {
+                    target_value: 0.0,
+                    target_tick: 1,
+                    initial_value: 0.0,
+                    initial_tick: 0,
+                };
+                CONTROLLER_COUNT as usize
+            ]),
+            tick_happened: (Mutex::new(false), Condvar::new()),
+            tick: 1.into(),
+        });
 
-        let weak_state = Arc::downgrade(&state);
-
-        let gen_controller_values = controller_values.clone();
+        let weak_state = Arc::downgrade(&plugin_shared);
 
         let (ui_send, ui_receive) = mpsc::channel(100);
         let (host_send, host_receive) = mpsc::channel(100);
-
-        let tick_happened = Arc::new((Mutex::new(false), Condvar::new()));
-        let gen_tick_happened = tick_happened.clone();
 
         let gen_ui_send = ui_send.clone();
 
         let gen_thread_handle = std::thread::spawn(move || {
             info!("Starting Gen thread!");
-            let controller_values = gen_controller_values;
 
             while let Some(state) = weak_state.upgrade() {
                 // Wait for a tick to happen before doing anything
                 {
-                    let &(ref tick_lock, ref cvar) = &*gen_tick_happened;
+                    let (ref tick_lock, ref cvar) = state.tick_happened;
                     let mut tick = tick_lock.lock();
                     while !*tick {
                         cvar.wait(&mut tick);
@@ -92,36 +136,53 @@ impl Plugin for Simple {
                     *tick = false;
                 }
 
-                // Steal state
-                let mut state = {
-                    let state = state.lock();
-                    state.clone()
-                };
+                let mut inputs = state.inputs.lock();
 
-                if state.speed == 0 {
-                    state.speed = 1;
+                if inputs.speed == 0 {
+                    inputs.speed = 1;
                 }
 
-                if state.tick % state.speed == 0 {
-                    let mut values = vec![0_u64; CONTROLLER_COUNT as usize];
+                let mut rng = thread_rng();
+                let this_tick = state.tick.load(Ordering::Acquire);
+                let is_speed_tick = this_tick % inputs.speed == 0;
 
-                    // Generate some new values NOW
-                    let mut rng = thread_rng();
+                let mut generators = state.generators.lock();
+                let mut values: Vec<(usize, f32)> = vec![];
 
-                    for v in &mut values {
-                        let random_value = rng.gen_range(0..0x1000);
-                        *v = random_value << 32;
+                for (i, generator) in generators.iter_mut().enumerate() {
+                    match generator {
+                        Generator::Random => {
+                            if is_speed_tick {
+                                values.push((i, rng.gen_range(0.0..1.0)));
+                            }
+                        }
+                        Generator::RandomInter {
+                            target_value,
+                            target_tick,
+                            initial_tick,
+                            initial_value,
+                        } => {
+                            if this_tick >= *target_tick {
+                                *initial_value = *target_value;
+                                *initial_tick = this_tick;
+                                *target_tick = this_tick + inputs.speed;
+                                *target_value = rng.gen_range(0.0..1.0);
+                            }
+
+                            let ratio = (this_tick - *initial_tick) as f32
+                                / (*target_tick - *initial_tick) as f32;
+                            let delta = *target_value - *initial_value;
+
+                            values.push((i, (*initial_value + (ratio * delta))));
+                        }
                     }
-
-                    // Store values
-                    (*controller_values.lock()).replace(values.clone());
-
-                    let ui_message =
-                        UIMessage::UpdateControllers(values.into_iter().enumerate().collect());
-
-                    // Inform UI of what we are doing
-                    gen_ui_send.blocking_send(ui_message).unwrap();
                 }
+
+                // Store values
+                (*state.controller_values.lock()).replace(values.clone());
+                let time = Utc::now();
+                let ui_message = UIMessage::UpdateControllers((time, values));
+                gen_ui_send.blocking_send(ui_message).unwrap();
             }
 
             info!("Gen thread done");
@@ -130,15 +191,13 @@ impl Plugin for Simple {
         Self {
             host,
             tag,
-            state,
             ui_send,
             ui_receive: Some(ui_receive),
             host_send,
             host_receive,
             proxy: None,
-            controller_values,
-            tick_happened,
             ui_thread: None,
+            inner: plugin_shared,
         }
     }
 
@@ -157,19 +216,23 @@ impl Plugin for Simple {
     }
 
     fn save_state(&mut self, writer: StateWriter) {
-        let state = self.state.lock();
-        match bincode::serialize_into(writer, &*state) {
-            Ok(_) => info!("state {:?} saved", self.state),
+        let state = SaveState::Ver1 {
+            inputs: self.inputs.lock().clone(),
+            generators: self.generators.lock().clone(),
+        };
+
+        match bincode::serialize_into(writer, &state) {
+            Ok(_) => info!("state {:?} saved", self.inputs),
             Err(e) => error!("error serializing state {}", e),
         }
     }
 
     fn load_state(&mut self, mut reader: StateReader) {
-        let mut buf = [0; std::mem::size_of::<State>()];
+        let mut buf = [0; std::mem::size_of::<PluginInputs>()];
         reader
             .read(&mut buf)
             .and_then(|_| {
-                bincode::deserialize::<State>(&buf).map_err(|e| {
+                bincode::deserialize::<SaveState>(&buf).map_err(|e| {
                     io::Error::new(
                         io::ErrorKind::Other,
                         format!("error deserializing value {}", e),
@@ -177,8 +240,24 @@ impl Plugin for Simple {
                 })
             })
             .and_then(|value| {
-                *self.state.lock() = value;
-                Ok(info!("read state {:?}", self.state))
+                info!("Read state {:?}", value);
+                match value {
+                    SaveState::Ver1 {
+                        inputs,
+                        mut generators,
+                    } => {
+                        for gen in &mut generators {
+                            if let Generator::RandomInter { target_tick, .. } = gen {
+                                *target_tick = 0;
+                            }
+                        }
+
+                        *self.inputs.lock() = inputs;
+                        *self.generators.lock() = generators;
+                    }
+                }
+
+                Ok(())
             })
             .unwrap_or_else(|e| error!("error reading value from state {}", e));
     }
@@ -225,20 +304,21 @@ impl Plugin for Simple {
     fn tick(&mut self) {
         // inform gen about the tick
         {
-            let &(ref lock, ref cvar) = &*self.tick_happened;
+            let (ref lock, ref cvar) = self.tick_happened;
             let mut tick = lock.lock();
             *tick = true;
             cvar.notify_one();
         }
-        {
-            let mut state = self.state.lock();
-            state.tick += 1;
-        }
 
-        // Inform FL about all our values
-        self.controller_values.lock().take().map(|v| {
-            for (i, v) in v.into_iter().enumerate() {
-                self.host.on_controller(self.tag, i, v)
+        self.tick.fetch_add(1, Ordering::Release);
+
+        let controller_values = &self.inner.controller_values;
+
+        // Inform FL about all our values, if they have changed
+        controller_values.lock().take().map(|v| {
+            for (i, v) in v.into_iter() {
+                self.host
+                    .on_controller(self.tag, i, ((v * 0x1000 as f32) as u64) << 32)
             }
         });
     }
@@ -275,7 +355,7 @@ impl Plugin for Simple {
             let speed = value.get::<u16>() as f64;
             let speed = (speed * 200.0) / 65535.0;
 
-            self.state.lock().speed = speed as u64;
+            self.inputs.lock().speed = speed as u64;
         }
 
         Box::new(0)
@@ -286,9 +366,9 @@ impl Plugin for Simple {
     }
 }
 
-impl RefUnwindSafe for Simple {}
+impl RefUnwindSafe for Plugin {}
 
-impl Simple {
+impl Plugin {
     fn on_set_enabled(&mut self, enabled: bool, message: host::Message) {
         self.log_selection();
         self.say_hello_hint();
@@ -321,7 +401,7 @@ impl Simple {
     }
 }
 
-impl Drop for Simple {
+impl Drop for Plugin {
     fn drop(&mut self) {
         info!("Dropping Plugin");
         // Tell the UI that we are dying
@@ -355,7 +435,7 @@ fn _init_log() {
     simple_logging::log_to_file(LOG_PATH, LevelFilter::Info).unwrap();
 }
 
-create_plugin!(Simple);
+create_plugin!(Plugin);
 
 use std::panic;
 

@@ -38,7 +38,7 @@ pub enum Message {
 #[derive(Debug, Clone)]
 pub enum UIMessage {
     ShowEditor(Option<*mut c_void>),
-    UpdateControllers(Vec<(usize, u64)>),
+    UpdateControllers((chrono::DateTime<chrono::Utc>, Vec<(usize, f32)>)),
     Die,
 }
 
@@ -112,10 +112,13 @@ impl Application for App {
                     |_| Message::None,
                 ))
             }
-            Message::HostMessage(UIMessage::UpdateControllers(updates)) => {
+            Message::HostMessage(UIMessage::UpdateControllers((time, updates))) => {
+                let old_time = chrono::Utc::now() - chrono::Duration::seconds(5);
                 for (controller_i, new_v) in updates {
                     self.charts[controller_i].update(UpdateState {
-                        new_value: (new_v >> 32) as i32,
+                        time,
+                        old_time,
+                        new_value: new_v,
                     });
                 }
                 None
