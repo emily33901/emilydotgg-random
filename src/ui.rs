@@ -4,15 +4,14 @@ use std::sync::Arc;
 use fpsdk::host::Host;
 use futures::lock::Mutex;
 use futures::stream;
-use iced::pure::widget::Text;
-use iced::pure::{button, column, text, Application};
+use iced::pure::{column, pick_list, text, Application};
 use iced::pure::{scrollable, Element};
 use iced::{Alignment, Command, Settings};
 use log::info;
 use tokio::sync::{mpsc, watch};
 
 use crate::ui::chart::UpdateState;
-use crate::CONTROLLER_COUNT;
+use crate::{GeneratorType, CONTROLLER_COUNT};
 
 use self::chart::WaveformChart;
 
@@ -32,6 +31,7 @@ pub struct App {
 pub enum Message {
     None,
     HostMessage(UIMessage),
+    ChangeGenerators(String),
 }
 
 /// Message from the Plugin to the UI
@@ -47,8 +47,9 @@ unsafe impl Sync for UIMessage {}
 
 #[derive(Debug, Clone, Copy)]
 /// Message from the UI to the Plugin
-pub enum HostMessage {
+pub(crate) enum HostMessage {
     SetEditorHandle(Option<*mut c_void>),
+    ChangeGenerators(GeneratorType),
 }
 
 unsafe impl Send for HostMessage {}
@@ -132,6 +133,24 @@ impl Application for App {
                 info!("UI got message {message:?}");
                 None
             }
+            Message::ChangeGenerators(to_what) => {
+                let host_message_tx = self.host_message_tx.clone();
+                Some(iced::Command::perform(
+                    async move {
+                        host_message_tx
+                            .lock()
+                            .await
+                            .send(HostMessage::ChangeGenerators(match to_what.as_str() {
+                                "Random" => GeneratorType::Random,
+                                "RandomInter" => GeneratorType::RandomInter,
+                                _ => panic!("Unknown generator type"),
+                            }))
+                            .await
+                            .unwrap()
+                    },
+                    |_| Message::None,
+                ))
+            }
         };
 
         command.unwrap_or(iced::Command::none())
@@ -153,6 +172,10 @@ impl Application for App {
         }
 
         let mut column = column().padding(20).align_items(Alignment::Center);
+
+        column = column.push(pick_list(vec!["Random", "RandomInter"], None, |t| {
+            Message::ChangeGenerators(t.into())
+        }));
 
         for chart in &self.charts {
             column = column.push(chart.view());

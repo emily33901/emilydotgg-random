@@ -47,8 +47,6 @@ struct Plugin {
     ui_thread: Option<JoinHandle<()>>,
 }
 
-pub(crate) fn interpolate<T>() {}
-
 /// Plugin shared state
 #[derive(Debug)]
 struct PluginShared {
@@ -57,6 +55,12 @@ struct PluginShared {
     generators: Mutex<Vec<Generator>>,
     tick_happened: (Mutex<bool>, Condvar),
     tick: AtomicU64,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum GeneratorType {
+    Random,
+    RandomInter,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -222,15 +226,15 @@ impl fpsdk::plugin::Plugin for Plugin {
         };
 
         match bincode::serialize_into(writer, &state) {
-            Ok(_) => info!("state {:?} saved", self.inputs),
+            Ok(_) => info!("state {:?} saved", state),
             Err(e) => error!("error serializing state {}", e),
         }
     }
 
     fn load_state(&mut self, mut reader: StateReader) {
-        let mut buf = [0; std::mem::size_of::<PluginInputs>()];
+        let mut buf: Vec<u8> = vec![];
         reader
-            .read(&mut buf)
+            .read_to_end(&mut buf)
             .and_then(|_| {
                 bincode::deserialize::<SaveState>(&buf).map_err(|e| {
                     io::Error::new(
@@ -247,8 +251,14 @@ impl fpsdk::plugin::Plugin for Plugin {
                         mut generators,
                     } => {
                         for gen in &mut generators {
-                            if let Generator::RandomInter { target_tick, .. } = gen {
-                                *target_tick = 0;
+                            if let Generator::RandomInter {
+                                target_tick,
+                                initial_tick,
+                                ..
+                            } = gen
+                            {
+                                *target_tick = 1;
+                                *initial_tick = 0;
                             }
                         }
 
@@ -275,12 +285,32 @@ impl fpsdk::plugin::Plugin for Plugin {
             _ => (),
         }
 
-        // See if we have any responses from the ui
+        // TODO(emily): Doing this here is a little questionable? We want to always be trying to process these,
+        // not just when FL sends us a message....
         while let Ok(response) = self.host_receive.try_recv() {
             info!("Host got {response:?}");
             match response {
                 ui::HostMessage::SetEditorHandle(hwnd) => {
                     self.proxy.as_ref().unwrap().set_editor_hwnd(hwnd.unwrap());
+                }
+                ui::HostMessage::ChangeGenerators(to_what) => {
+                    self.host.on_message(
+                        self.tag,
+                        message::DebugLogMsg(format!("changing generators to {:?}", to_what)),
+                    );
+
+                    let mut generators = self.generators.lock();
+                    for gen in &mut *generators {
+                        *gen = match to_what {
+                            GeneratorType::Random => Generator::Random,
+                            GeneratorType::RandomInter => Generator::RandomInter {
+                                target_value: 0.0,
+                                target_tick: 1,
+                                initial_value: 0.0,
+                                initial_tick: 0,
+                            },
+                        }
+                    }
                 }
             }
         }
