@@ -55,6 +55,7 @@ struct PluginShared {
     generators: Mutex<Vec<Generator>>,
     tick_happened: (Mutex<bool>, Condvar),
     tick: AtomicU64,
+    editor_visible: Mutex<bool>,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -117,6 +118,7 @@ impl fpsdk::plugin::Plugin for Plugin {
             ]),
             tick_happened: (Mutex::new(false), Condvar::new()),
             tick: 1.into(),
+            editor_visible: Mutex::new(false),
         });
 
         let weak_state = Arc::downgrade(&plugin_shared);
@@ -184,9 +186,12 @@ impl fpsdk::plugin::Plugin for Plugin {
 
                 // Store values
                 (*state.controller_values.lock()).replace(values.clone());
-                let time = Utc::now();
-                let ui_message = UIMessage::UpdateControllers((time, values));
-                gen_ui_send.blocking_send(ui_message).unwrap();
+
+                if *state.editor_visible.lock() {
+                    let time = Utc::now();
+                    let ui_message = UIMessage::UpdateControllers((time, values));
+                    gen_ui_send.blocking_send(ui_message).unwrap();
+                }
             }
 
             info!("Gen thread done");
@@ -278,10 +283,13 @@ impl fpsdk::plugin::Plugin for Plugin {
             host::Message::SetEnabled(enabled) => {
                 self.on_set_enabled(enabled, message);
             }
-            host::Message::ShowEditor(handle) => self
-                .ui_send
-                .blocking_send(ui::UIMessage::ShowEditor(handle))
-                .unwrap(),
+            host::Message::ShowEditor(handle) => {
+                self.ui_send
+                    .blocking_send(ui::UIMessage::ShowEditor(handle))
+                    .unwrap();
+
+                *self.inner.editor_visible.lock() = handle.is_some();
+            }
             _ => (),
         }
 
@@ -377,13 +385,11 @@ impl fpsdk::plugin::Plugin for Plugin {
         );
 
         if flags.contains(ProcessParamFlags::FROM_MIDI | ProcessParamFlags::UPDATE_VALUE) {
-            // will work if assigned to itself
-
             // Scale speed into a more appropriate range
             // it will be 0 - 65535 coming in and we want it to be less
 
             let speed = value.get::<u16>() as f64;
-            let speed = (speed * 200.0) / 65535.0;
+            let speed = (speed / 65535.0) * 600.0;
 
             self.inputs.lock().speed = speed as u64;
         }
