@@ -25,35 +25,8 @@ pub struct App {
     charts: Vec<chart::WaveformChart>,
     should_exit: bool,
     should_draw: bool,
+    generator_type: String,
 }
-
-#[derive(Debug, Clone)]
-pub enum Message {
-    None,
-    HostMessage(UIMessage),
-    ChangeGenerators(String),
-}
-
-/// Message from the Plugin to the UI
-#[derive(Debug, Clone)]
-pub enum UIMessage {
-    ShowEditor(Option<*mut c_void>),
-    UpdateControllers((chrono::DateTime<chrono::Utc>, Vec<(usize, f32)>)),
-    Die,
-}
-
-unsafe impl Send for UIMessage {}
-unsafe impl Sync for UIMessage {}
-
-#[derive(Debug, Clone, Copy)]
-/// Message from the UI to the Plugin
-pub(crate) enum HostMessage {
-    SetEditorHandle(Option<*mut c_void>),
-    ChangeGenerators(GeneratorType),
-}
-
-unsafe impl Send for HostMessage {}
-unsafe impl Sync for HostMessage {}
 
 pub struct AppFlags {
     ui_message_rx: mpsc::Receiver<UIMessage>,
@@ -74,6 +47,7 @@ impl Application for App {
                     .collect(),
                 should_exit: false,
                 should_draw: false,
+                generator_type: "Deranged put something here please".into(),
             },
             Command::none(),
         )
@@ -134,17 +108,20 @@ impl Application for App {
                 None
             }
             Message::ChangeGenerators(to_what) => {
+                let new_type = match to_what.as_str() {
+                    "Random" => GeneratorType::Random,
+                    "RandomInter" => GeneratorType::RandomInter,
+                    _ => panic!("Unknown generator type"),
+                };
+                self.generator_type = to_what.clone();
+
                 let host_message_tx = self.host_message_tx.clone();
                 Some(iced::Command::perform(
                     async move {
                         host_message_tx
                             .lock()
                             .await
-                            .send(HostMessage::ChangeGenerators(match to_what.as_str() {
-                                "Random" => GeneratorType::Random,
-                                "RandomInter" => GeneratorType::RandomInter,
-                                _ => panic!("Unknown generator type"),
-                            }))
+                            .send(HostMessage::ChangeGenerators(new_type))
                             .await
                             .unwrap()
                     },
@@ -173,9 +150,11 @@ impl Application for App {
 
         let mut column = column().padding(20).align_items(Alignment::Center);
 
-        column = column.push(pick_list(vec!["Random", "RandomInter"], None, |t| {
-            Message::ChangeGenerators(t.into())
-        }));
+        column = column.push(pick_list(
+            vec!["Random".into(), "RandomInter".into()],
+            Some(self.generator_type.clone()),
+            |t| Message::ChangeGenerators(t.into()),
+        ));
 
         for chart in &self.charts {
             column = column.push(chart.view());
@@ -198,6 +177,34 @@ impl Application for App {
 }
 
 impl App {}
+
+#[derive(Debug, Clone)]
+pub enum Message {
+    None,
+    HostMessage(UIMessage),
+    ChangeGenerators(String),
+}
+
+/// Message from the Plugin to the UI
+#[derive(Debug, Clone)]
+pub enum UIMessage {
+    ShowEditor(Option<*mut c_void>),
+    UpdateControllers((chrono::DateTime<chrono::Utc>, Vec<(usize, f32)>)),
+    Die,
+}
+
+unsafe impl Send for UIMessage {}
+unsafe impl Sync for UIMessage {}
+
+#[derive(Debug, Clone, Copy)]
+/// Message from the UI to the Plugin
+pub(crate) enum HostMessage {
+    SetEditorHandle(Option<*mut c_void>),
+    ChangeGenerators(GeneratorType),
+}
+
+unsafe impl Send for HostMessage {}
+unsafe impl Sync for HostMessage {}
 
 #[derive(Clone)]
 struct UIMessageWatcher {

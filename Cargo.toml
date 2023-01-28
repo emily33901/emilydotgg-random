@@ -43,3 +43,8 @@ iced_core = { path = "iced/core" }
 iced_style = { path = "iced/style" }
 iced_pure = { path = "iced/pure" }
 iced_graphics = { path = "iced/graphics" }
+
+
+[profile.release]
+debug = true
+split-debuginfo = "packed"

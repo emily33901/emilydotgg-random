@@ -1,6 +1,9 @@
 use chrono::Utc;
 use derive_more::{Deref, DerefMut};
+use fpsdk::plugin::message::ActivateMidi;
+use fpsdk::voice::{ReceiveVoiceHandler, SendVoiceHandler};
 use parking_lot::{Condvar, Mutex};
+use std::collections::HashMap;
 use std::io::{self, Read};
 use std::panic::RefUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -45,6 +48,7 @@ struct Plugin {
     host_receive: mpsc::Receiver<ui::HostMessage>,
     proxy: Option<PluginProxy>,
     ui_thread: Option<JoinHandle<()>>,
+    voices: HashMap<fpsdk::voice::Tag, Box<Voice>>,
 }
 
 /// Plugin shared state
@@ -153,13 +157,29 @@ impl fpsdk::plugin::Plugin for Plugin {
                 let is_speed_tick = this_tick % inputs.speed == 0;
 
                 let mut generators = state.generators.lock();
-                let mut values: Vec<(usize, f32)> = vec![];
+
+                // TODO(emily): Here we need to be able to send 'values' to the UI thread that will
+                // happen in the future... i.e. with RandomInter we are representing a straight line
+                // with lots of smaller values (1 per tick ish). Instead of that we should just be
+                // able to send the end point, and what time that end point should appear at.
+                // That way we dont send so many fucking values every tick when its completely
+                // unnecessary to do so. This would also SIGNIFICANTLY improve the perf of the UI by
+                // enabling it to not have to plot 1000k values all  the fucking time.
+
+                // Values that are given to FL studio
+                let mut controller_values: Vec<(usize, f32)> = vec![];
+                controller_values.reserve(generators.len());
+                // Values that are given to the UI to render
+                let mut ui_values: Vec<(usize, f32)> = vec![];
+                ui_values.reserve(generators.len());
 
                 for (i, generator) in generators.iter_mut().enumerate() {
                     match generator {
                         Generator::Random => {
                             if is_speed_tick {
-                                values.push((i, rng.gen_range(0.0..1.0)));
+                                let value = rng.gen_range(0.0..1.0);
+                                controller_values.push((i, value));
+                                ui_values.push((i, value))
                             }
                         }
                         Generator::RandomInter {
@@ -173,23 +193,25 @@ impl fpsdk::plugin::Plugin for Plugin {
                                 *initial_tick = this_tick;
                                 *target_tick = this_tick + inputs.speed;
                                 *target_value = rng.gen_range(0.0..1.0);
+                                ui_values.push((i, *target_value));
                             }
 
                             let ratio = (this_tick - *initial_tick) as f32
                                 / (*target_tick - *initial_tick) as f32;
                             let delta = *target_value - *initial_value;
 
-                            values.push((i, (*initial_value + (ratio * delta))));
+                            controller_values.push((i, (*initial_value + (ratio * delta))));
                         }
                     }
                 }
 
                 // Store values
-                (*state.controller_values.lock()).replace(values.clone());
+                (*state.controller_values.lock()).replace(controller_values.clone());
 
+                let time = Utc::now();
                 if *state.editor_visible.lock() {
-                    let time = Utc::now();
-                    let ui_message = UIMessage::UpdateControllers((time, values));
+                    let ui_message = UIMessage::UpdateControllers((time, ui_values));
+                    // TODO(emily): probably want to try_send here instead of blocking
                     gen_ui_send.blocking_send(ui_message).unwrap();
                 }
             }
@@ -207,6 +229,7 @@ impl fpsdk::plugin::Plugin for Plugin {
             proxy: None,
             ui_thread: None,
             inner: plugin_shared,
+            voices: HashMap::new(),
         }
     }
 
@@ -217,11 +240,17 @@ impl fpsdk::plugin::Plugin for Plugin {
     fn info(&self) -> Info {
         info!("plugin {} will return info", self.tag);
 
-        InfoBuilder::new_effect("emilydotgg-random", "Random", 3)
+        let info = InfoBuilder::new_effect("emilydotgg-random", "Random", 3)
             .want_new_tick()
             .with_out_ctrls(100)
-            .no_process()
-            .build()
+            .with_out_voices(100)
+            // .no_process()
+            // .midi_out()
+            // .with_poly(16)
+            .get_note_input()
+            .build();
+
+        return info;
     }
 
     fn save_state(&mut self, writer: StateWriter) {
@@ -278,7 +307,7 @@ impl fpsdk::plugin::Plugin for Plugin {
     }
 
     fn on_message(&mut self, message: host::Message) -> Box<dyn AsRawPtr> {
-        // info!("Plugin got {:?}", message);
+        info!("Plugin got {:?}", message);
         match message {
             host::Message::SetEnabled(enabled) => {
                 self.on_set_enabled(enabled, message);
@@ -327,8 +356,6 @@ impl fpsdk::plugin::Plugin for Plugin {
     }
 
     fn name_of(&self, message: GetName) -> String {
-        info!("{} host asks name of {:?}", self.tag, message);
-
         match message {
             GetName::OutCtrl(index) => format!("Control {index}"),
             _ => "What?".into(),
@@ -353,12 +380,16 @@ impl fpsdk::plugin::Plugin for Plugin {
         let controller_values = &self.inner.controller_values;
 
         // Inform FL about all our values, if they have changed
-        controller_values.lock().take().map(|v| {
+
+        let controller_values = { controller_values.lock().take() };
+        controller_values.map(|v| {
             for (i, v) in v.into_iter() {
                 self.host
                     .on_controller(self.tag, i, ((v * 0x1000 as f32) as u64) << 32)
             }
         });
+
+        // self.host.midi_out(self.tag)
     }
 
     fn idle(&mut self) {
@@ -398,7 +429,61 @@ impl fpsdk::plugin::Plugin for Plugin {
     }
 
     fn midi_in(&mut self, message: MidiMessage) {
-        trace!("receive MIDI message {:?}", message);
+        info!("receive MIDI message {:?}", message);
+    }
+
+    fn voice_handler(&mut self) -> Option<&mut dyn ReceiveVoiceHandler> {
+        Some(self)
+    }
+
+    fn render(&mut self, input: &[[f32; 2]], output: &mut [[f32; 2]]) {
+        // consider it an effect
+        input.iter().zip(output).for_each(|(inp, outp)| {
+            outp[0] = inp[0]; // * 0.25;
+            outp[1] = inp[1]; // * 0.25;
+        });
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Voice {
+    tag: fpsdk::voice::Tag,
+}
+
+impl fpsdk::voice::Voice for Voice {
+    fn tag(&self) -> fpsdk::voice::Tag {
+        self.tag
+    }
+}
+
+impl ReceiveVoiceHandler for Plugin {
+    fn trigger(
+        &mut self,
+        params: fpsdk::voice::Params,
+        tag: fpsdk::voice::Tag,
+    ) -> &mut dyn fpsdk::voice::Voice {
+        info!("ReceiveVoiceHandler::trigger");
+
+        let voice = Box::new(Voice { tag });
+        self.voices.insert(tag, voice);
+
+        self.voices.get_mut(&tag).unwrap().as_mut()
+    }
+
+    fn release(&mut self, tag: fpsdk::voice::Tag) {
+        info!("ReceiveVoiceHandler::release");
+        self.voices.remove(&tag);
+    }
+
+    fn kill(&mut self, tag: fpsdk::voice::Tag) {
+        self.voices.remove(&tag);
+        info!("ReceiveVoiceHandler::kill");
+    }
+}
+
+impl SendVoiceHandler for Plugin {
+    fn kill(&mut self, tag: fpsdk::voice::Tag) {
+        info!("kill voice {tag}");
     }
 }
 
@@ -417,6 +502,8 @@ impl Plugin {
                 self.host_send.clone(),
             ));
         }
+
+        // self.host.on_message(self.tag, ActivateMidi);
     }
 
     fn log_selection(&mut self) {

@@ -60,6 +60,15 @@ impl Chart<Message> for WaveformChart {
                 &RED,
             ))
             .unwrap();
+
+        // chart
+        // .draw_series(PointSeries::of_element(
+        //     self.values.iter().map(|x| (x.0, x.1)),
+        //     1.0,
+        //     &RED,
+        //     &|coord, size, style| EmptyElement::at(coord) + Circle::new((0, 0), size, style),
+        // ))
+        // .unwrap();
     }
 }
 
